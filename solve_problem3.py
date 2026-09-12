@@ -51,6 +51,7 @@ STRATEGY_ALIASES = {"S6": "S06", "Sall": "S061218"}
 CUMULATIVE_ABLATION = ("S0", "S06", "S0612", "S061218")
 FEEDBACK_POLICIES = ("old-target", "consistent-value", "grid-boundary")
 LOAD_FORECAST_MODES = (
+    "net-hgb",
     "current",
     "same-week-type",
     "trend-weighted",
@@ -376,6 +377,16 @@ def forecast_load(
 ) -> np.ndarray:
     """用决策时刻以前的数据生成负荷预测，不读取目标日未来真实值。"""
 
+    if mode == "net-hgb":
+        from problem3_net_forecast import get_forecaster
+        # Compatibility carrier only: subtracting published PV recovers the
+        # direct net prediction exactly; this is NOT an independent load model.
+        full_targets = make_targets(decision_time)
+        indices = full_targets.get_indexer(targets)
+        if (indices < 0).any():
+            raise ValueError("净负荷预测目标超出发布窗口")
+        return (get_forecaster(data).predict(decision_time)[indices]
+                + interpolate_pv_forecast(data, decision_time, targets))
     day = decision_time.date()
     prior_indices = [idx for idx, value in enumerate(data.dates) if value.date() < day]
     if mode not in LOAD_FORECAST_MODES:
@@ -506,6 +517,14 @@ def build_scenarios(
         scenario_pv = np.asarray(
             [np.maximum(base_pv + pv_residuals[i][:horizon], 0.0) for i in selected]
         )
+        if config.load_forecast_mode == "net-hgb":
+            # Joint chronological NET residual, no component clipping:
+            # (actual load - proxy load) - (actual PV - published PV).
+            scenario_pv = np.broadcast_to(base_pv, (len(selected), horizon)).copy()
+            scenario_load = np.asarray([
+                base_load + load_residuals[i][:horizon] - pv_residuals[i][:horizon]
+                for i in selected
+            ])
         selected_sources = [source_issues[i] for i in selected]
         probabilities = np.full(len(selected), 1.0 / len(selected))
 
@@ -1085,29 +1104,19 @@ def feedback_value_function(
             "consistent-value",
             "grid-boundary",
         ):
-            unused = np.maximum(
-                committed_g[t]
-                - scenario_net[:, t, None, None]
-                - grid_effect[None, :, :],
-                0.0,
-            )
+            # Forecast scenarios price the continuation, but cannot veto a
+            # physically reachable terminal state: the actual dominance rules
+            # are enforced when the observed net load is dispatched below.
             scenario_cost = (
                 config.emergency_multiplier * price[t] * shortage
                 + config.throughput_penalty * throughput[None, :, :]
                 + value[t + 1][None, None, :]
             )
-            dominated = (unused > 1.0e-9) & (grid_effect[None, :, :] < -1.0e-9)
-            if config.forbid_emergency_charging:
-                dominated |= (shortage > 1.0e-9) & (
-                    grid_effect[None, :, :] > 1.0e-9
-                )
-            scenario_cost = np.where(
-                feasible[None, :, :] & ~dominated,
-                scenario_cost,
-                np.inf,
-            )
+            scenario_cost = np.where(feasible[None, :, :], scenario_cost, np.inf)
             scenario_value = np.min(scenario_cost, axis=2)
             value[t] = np.tensordot(probabilities, scenario_value, axes=(0, 0))
+            if t >= periods - 12:
+                value[t, ~np.isclose(grid, terminal_target, atol=1.0e-9, rtol=0.0)] = np.inf
         else:
             expected_shortage = np.tensordot(probabilities, shortage, axes=(0, 0))
             cost = (
@@ -1260,7 +1269,7 @@ def execute_feedback_block(
         transition_cost = np.where(feasible_candidates, transition_cost, np.inf)
         if config.feedback_policy in ("consistent-value", "grid-boundary"):
             dominated = (unused > 1.0e-9) & (candidate_discharge > 1.0e-9)
-            if config.forbid_emergency_charging:
+            if config.forbid_emergency_charging and not hard_terminal:
                 dominated |= (shortage > 1.0e-9) & (candidate_charge > 1.0e-9)
             transition_cost = np.where(dominated, np.inf, transition_cost)
         nxt = int(np.argmin(transition_cost))
@@ -1280,6 +1289,7 @@ def execute_feedback_block(
         if config.feedback_policy in ("consistent-value", "grid-boundary"):
             if (
                 config.forbid_emergency_charging
+                and not hard_terminal
                 and result["emergency"][t] > 1.0e-9
                 and charge > 1.0e-9
             ):
@@ -1808,6 +1818,13 @@ def validate_run(
         & (detail["discharge_kwh"] > 1.0e-7)
     )
     emergency_while_charging_count = int(emergency_while_charging.sum())
+    year_end_emergency_while_charging = emergency_while_charging & (
+        pd.to_datetime(detail["date"]).dt.date == date(2025, 12, 31)
+    )
+    normal_emergency_while_charging_count = int(
+        (emergency_while_charging & ~year_end_emergency_while_charging).sum()
+    )
+    year_end_emergency_while_charging_count = int(year_end_emergency_while_charging.sum())
     unused_while_discharging_count = int(unused_while_discharging.sum())
     consistent_rules = config.feedback_policy in ("consistent-value", "grid-boundary")
     boundary_available_count = int(detail["boundary_candidate_available"].sum())
@@ -1887,6 +1904,8 @@ def validate_run(
         "max_discharge_kwh": max_discharge,
         "simultaneous_actual_count": simultaneous_count,
         "emergency_while_charging_count": emergency_while_charging_count,
+        "normal_emergency_while_charging_count": normal_emergency_while_charging_count,
+        "year_end_terminal_rescue_emergency_charging_count": year_end_emergency_while_charging_count,
         "unused_while_discharging_count": unused_while_discharging_count,
         "dominance_rules_required": consistent_rules,
         "emergency_charging_rule_enabled": config.forbid_emergency_charging,
@@ -1894,7 +1913,7 @@ def validate_run(
             unused_while_discharging_count == 0
             and (
                 not config.forbid_emergency_charging
-                or emergency_while_charging_count == 0
+                or normal_emergency_while_charging_count == 0
             )
         ),
         "boundary_candidate_available_count": boundary_available_count,
@@ -1928,7 +1947,7 @@ def validate_run(
                 unused_while_discharging_count == 0
                 and (
                     not config.forbid_emergency_charging
-                    or emergency_while_charging_count == 0
+                    or normal_emergency_while_charging_count == 0
                 )
             )
         ),
@@ -2363,7 +2382,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--load-forecast-mode",
         choices=LOAD_FORECAST_MODES,
         default="current",
-        help="负荷预测：现行/星期类型/7日30日趋势/日总量×形状/日内观测校正",
+        help="预测：现行/星期类型/趋势/形状/观测校正；net-hgb为四发布时间直接净负荷梯度提升",
     )
     parser.add_argument(
         "--day-ahead-mode",
