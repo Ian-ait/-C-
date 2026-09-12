@@ -806,6 +806,31 @@ def solve_stochastic_mpc(
     inequality = SparseRows()
     active_update_slots = [UPDATE_SLOTS[h] for h in STRATEGIES[strategy]]
     final_hard_terminal = bool(bundle.targets[-1] == YEAR_END)
+    if (
+        final_hard_terminal
+        and not initial_decision
+        and decision_slot == UPDATE_SLOTS[18]
+        and commit_count >= 9
+    ):
+        # The 18:00 decision must leave one causal discharge opportunity
+        # immediately before the final interval. Otherwise a positive final
+        # contract can create surplus, and w>0 => d=0 makes exact terminal SOC
+        # impossible even though the unconstrained LP trajectory is feasible.
+        # Eight intervals cover the worst possible 4,320 kWh output needed
+        # to move from SOC max to the 6,000 kWh target at eta_d=0.9. Capping
+        # purchases at the minimum causal scenario net load reserves a legal
+        # discharge sink without forcing all late purchases to zero.
+        reserve_slice = slice(commit_count - 9, commit_count - 1)
+        reserve_output_per_slot = (
+            (params.soc_max - config.final_soc) * params.eta_discharge / 8.0
+        )
+        robust_caps = np.maximum(
+            np.min(bundle.net_load[:, reserve_slice], axis=0)
+            - reserve_output_per_slot,
+            0.0,
+        )
+        for index, cap in zip(commit_index[reserve_slice], robust_caps):
+            bounds[int(index)] = (0.0, float(cap))
     salvage = _terminal_value(price, params)
 
     for scenario, (indices, probability) in enumerate(
@@ -1115,8 +1140,17 @@ def feedback_value_function(
             scenario_cost = np.where(feasible[None, :, :], scenario_cost, np.inf)
             scenario_value = np.min(scenario_cost, axis=2)
             value[t] = np.tensordot(probabilities, scenario_value, axes=(0, 0))
-            if t >= periods - 12:
-                value[t, ~np.isclose(grid, terminal_target, atol=1.0e-9, rtol=0.0)] = np.inf
+            if config.forbid_emergency_charging:
+                # Emergency energy is limited to the current load gap. Keeping
+                # this reserve makes final-SOC reachability causal and robust.
+                value[t, grid < float(terminal_target) - 1.0e-9] = np.inf
+            if t == periods - 1:
+                # Enter the final delivery interval at the target. During that
+                # interval the executor can hold SOC while settling either an
+                # actual shortage or surplus without a dominated battery move.
+                value[t, ~np.isclose(
+                    grid, terminal_target, atol=1.0e-9, rtol=0.0
+                )] = np.inf
         else:
             expected_shortage = np.tensordot(probabilities, shortage, axes=(0, 0))
             cost = (
@@ -1269,9 +1303,32 @@ def execute_feedback_block(
         transition_cost = np.where(feasible_candidates, transition_cost, np.inf)
         if config.feedback_policy in ("consistent-value", "grid-boundary"):
             dominated = (unused > 1.0e-9) & (candidate_discharge > 1.0e-9)
-            if config.forbid_emergency_charging and not hard_terminal:
+            if config.forbid_emergency_charging:
                 dominated |= (shortage > 1.0e-9) & (candidate_charge > 1.0e-9)
             transition_cost = np.where(dominated, np.inf, transition_cost)
+        if (
+            hard_terminal
+            and config.forbid_emergency_charging
+            and terminal_target is not None
+            and current_soc > terminal_target + 1.0e-9
+        ):
+            # Excess terminal inventory can only be removed in a real deficit:
+            # dumping battery energy into an existing surplus is forbidden.
+            # Use each observed deficit immediately, down to the terminal floor,
+            # so feasibility is not deferred to unknown future observations.
+            raw_gap = float(actual_net[t] - committed_g[t])
+            if raw_gap > 1.0e-9:
+                discharge_now = min(
+                    raw_gap,
+                    params.max_discharge_kwh,
+                    (current_soc - terminal_target) * params.eta_discharge,
+                )
+                required_next_soc = current_soc - discharge_now / params.eta_discharge
+                transition_cost = np.where(
+                    candidate_soc <= required_next_soc + 1.0e-7,
+                    transition_cost,
+                    np.inf,
+                )
         nxt = int(np.argmin(transition_cost))
         if not np.isfinite(transition_cost[nxt]):
             raise FeedbackNoActionError(t, current_soc)
@@ -1289,7 +1346,6 @@ def execute_feedback_block(
         if config.feedback_policy in ("consistent-value", "grid-boundary"):
             if (
                 config.forbid_emergency_charging
-                and not hard_terminal
                 and result["emergency"][t] > 1.0e-9
                 and charge > 1.0e-9
             ):
@@ -1913,7 +1969,7 @@ def validate_run(
             unused_while_discharging_count == 0
             and (
                 not config.forbid_emergency_charging
-                or normal_emergency_while_charging_count == 0
+                or emergency_while_charging_count == 0
             )
         ),
         "boundary_candidate_available_count": boundary_available_count,
@@ -1947,7 +2003,7 @@ def validate_run(
                 unused_while_discharging_count == 0
                 and (
                     not config.forbid_emergency_charging
-                    or normal_emergency_while_charging_count == 0
+                    or emergency_while_charging_count == 0
                 )
             )
         ),
