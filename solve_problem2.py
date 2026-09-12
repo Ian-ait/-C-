@@ -860,7 +860,7 @@ def main():
     parser.add_argument(
         "--soc-step",
         type=float,
-        default=200.0,
+        default=100.0,
         help="DP的SOC离散步长，越小越精细但越慢",
     )
 
