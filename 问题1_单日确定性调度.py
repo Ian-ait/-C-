@@ -22,8 +22,12 @@ from scipy.optimize import linprog
 # 1. 基本参数
 # =========================
 
-DATA_PATH = Path(r"C:\Users\LENOVO\Desktop\数模\C题\附件\附件1.xlsx")
-OUT_DIR = Path(r"C:\Users\LENOVO\Desktop\数模\C题\analysis_outputs")
+BASE_DIR = Path(__file__).resolve().parent
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_PATH = BASE_DIR / "附件" / "附件1.xlsx"
+OUT_DIR = BASE_DIR / "analysis_outputs"
+
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 T = 144
