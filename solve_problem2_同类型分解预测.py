@@ -25,11 +25,12 @@ C:/Users/LENOVO/Desktop/数模/C题/outputs/problem2_same_type_forecast/
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.optimize import linprog
@@ -2203,6 +2204,9 @@ def plot_results(
     daily_summary: pd.DataFrame,
     detail: pd.DataFrame,
 ):
+    # 旧分位数引擎才生成图；默认静态MPC不应依赖 matplotlib。
+    import matplotlib.pyplot as plt
+
     """绘制正式评价期结果图。"""
 
     plt.rcParams["font.sans-serif"] = [
@@ -2318,7 +2322,7 @@ def plot_results(
     plt.close(fig)
 
 
-def main():
+def legacy_main():
     parser = argparse.ArgumentParser(
         description="问题二：日前LP + 日内因果DP（跨日连续版本）"
     )
@@ -3939,5 +3943,180 @@ def generate_submission_tables(
 
     return submission_path
 
+def build_static_mpc_parser() -> argparse.ArgumentParser:
+    """问题二默认入口：仅0点计划，复用问题三经过验证的因果MPC。"""
+    parser = argparse.ArgumentParser(
+        description="问题二：仅0点日前计划的因果随机MPC",
+    )
+    parser.add_argument("--data-dir", type=Path, default=Path("附件"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs/problem2_static_mpc"),
+    )
+    parser.add_argument("--date", default="2025-01-01")
+    parser.add_argument("--days", type=int, default=1)
+    parser.add_argument("--all-year", action="store_true")
+    parser.add_argument("--progress-every-days", type=int, default=1)
+    parser.add_argument("--initial-soc", type=float, default=None)
+    parser.add_argument("--scenarios", type=int, default=12)
+    parser.add_argument("--history-days", type=int, default=30)
+    parser.add_argument("--seed", type=int, default=2025)
+    parser.add_argument("--soc-step", type=float, default=100.0)
+    parser.add_argument(
+        "--load-forecast-mode",
+        choices=(
+            "net-hgb", "current", "same-week-type", "trend-weighted",
+            "shape-level", "observed-corrected",
+        ),
+        default="current",
+    )
+    return parser
+
+
+def static_mpc_main(argv: list[str] | None = None) -> int:
+    """Run a fair problem-2 policy through the shared problem-3 engine.
+
+    The S0 strategy commits the complete daily contract at midnight and never
+    adjusts it later.  It nevertheless retains causal 10-minute storage
+    feedback, January SOC replay, the common bill, dominance rules, and the
+    2025-12-31 hard terminal condition.
+    """
+    args = build_static_mpc_parser().parse_args(argv)
+    if args.days <= 0 or args.progress_every_days <= 0:
+        raise ValueError("--days和--progress-every-days必须为正整数")
+    if args.all_year and args.days != 1:
+        raise ValueError("--all-year不能与--days同时使用")
+
+    # Import lazily so --legacy-engine preserves the original standalone path.
+    from solve_problem3 import main as problem3_main
+
+    forwarded = [
+        "--data-dir", str(args.data_dir),
+        "--output-dir", str(args.output_dir),
+        "--control-policy", "static_plan",
+        "--forecast-source", "history-only",
+        "--date", "2025-01-01" if args.all_year else str(args.date),
+        "--days", str(365 if args.all_year else args.days),
+        "--progress-every-days", str(args.progress_every_days),
+        "--scenarios", str(args.scenarios),
+        "--history-days", str(args.history_days),
+        "--seed", str(args.seed),
+        "--soc-step", str(args.soc_step),
+        "--feedback-policy", "grid-boundary",
+        "--forbid-emergency-charging",
+    ]
+    if args.initial_soc is not None:
+        forwarded.extend(["--initial-soc", str(args.initial_soc)])
+
+    print(
+        "问题2静态MPC：仅使用附件1/2的历史信息，且仅0点提交合同购电；"
+        "6/12/18点不调整。",
+        flush=True,
+    )
+    exit_code = problem3_main(forwarded)
+
+    detail = pd.read_csv(args.output_dir / "problem3_detail.csv")
+    daily = pd.read_csv(args.output_dir / "daily_summary.csv")
+    ledger = pd.read_csv(args.output_dir / "decision_ledger.csv")
+    forecast_audit = pd.read_csv(args.output_dir / "forecast_audit.csv")
+    comparison = pd.read_csv(args.output_dir / "control_comparison.csv").iloc[0]
+
+    detail_dates = pd.to_datetime(detail["date"])
+    daily_dates = pd.to_datetime(daily["date"])
+    formal_detail = detail[
+        (detail_dates >= pd.Timestamp("2025-02-01"))
+        & (detail_dates <= pd.Timestamp("2025-12-31"))
+    ]
+    formal_daily = daily[
+        (daily_dates >= pd.Timestamp("2025-02-01"))
+        & (daily_dates <= pd.Timestamp("2025-12-31"))
+    ]
+    decision_times = pd.to_datetime(ledger["decision_time"])
+    audit_times = pd.to_datetime(forecast_audit["decision_time"])
+    only_midnight = bool(
+        (decision_times.dt.hour.eq(0) & decision_times.dt.minute.eq(0)).all()
+        and (audit_times.dt.hour.eq(0) & audit_times.dt.minute.eq(0)).all()
+    )
+    zero_adjustments = bool(
+        detail[["upward_adjustment_kwh", "downward_adjustment_kwh"]]
+        .abs().le(1.0e-7).all().all()
+    )
+    soc_continuous = bool(
+        len(daily) <= 1
+        or np.allclose(
+            daily["soc_start_kwh"].to_numpy(dtype=float)[1:],
+            daily["soc_end_kwh"].to_numpy(dtype=float)[:-1],
+            atol=1.0e-7,
+        )
+    )
+    formal_total = float(formal_detail["total_cost_yuan"].sum())
+    summary_total = float(comparison["total_cost_yuan"])
+    formal_cost_matches = bool(np.isclose(formal_total, summary_total, atol=0.01))
+    history_only = bool(
+        forecast_audit["forecast_source"].eq("history-only").all()
+        and forecast_audit["mature_only"].all()
+    )
+    checks = {
+        "forecast_source": "history-only",
+        "attachment3_required": False,
+        "control_policy": "static_plan",
+        "only_midnight_decisions": only_midnight,
+        "zero_upward_and_downward_adjustments": zero_adjustments,
+        "mature_history_only": history_only,
+        "soc_continuous_between_days": soc_continuous,
+        "simulated_days": int(daily_dates.dt.date.nunique()),
+        "formal_days": int(formal_daily["date"].nunique()),
+        "formal_total_cost_yuan": formal_total,
+        "formal_detail_cost_matches_summary": formal_cost_matches,
+        "ending_soc_kwh": float(daily.iloc[-1]["soc_end_kwh"]),
+        "full_year_formal_days_is_334": (
+            bool(formal_daily["date"].nunique() == 334) if args.all_year else None
+        ),
+        "full_year_ending_soc_is_6000": (
+            bool(np.isclose(float(daily.iloc[-1]["soc_end_kwh"]), 6000.0, atol=1.0e-7))
+            if args.all_year else None
+        ),
+    }
+    required = (
+        only_midnight,
+        zero_adjustments,
+        history_only,
+        soc_continuous,
+        formal_cost_matches,
+    )
+    if not all(required):
+        raise RuntimeError(f"问题2信息口径检查失败：{checks}")
+    if args.all_year and not (
+        checks["full_year_formal_days_is_334"]
+        and checks["full_year_ending_soc_is_6000"]
+    ):
+        raise RuntimeError(f"问题2全年口径检查失败：{checks}")
+    (args.output_dir / "problem2_information_scope_checks.json").write_text(
+        json.dumps(checks, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(
+        f"问题2口径检查通过：正式天数={checks['formal_days']}，"
+        f"正式费用={formal_total:,.2f}元（不含1月）。",
+        flush=True,
+    )
+    return exit_code
+
+
+def main() -> int:
+    """Default to the validated static-MPC engine; retain the legacy engine."""
+    argv = sys.argv[1:]
+    if "--legacy-engine" in argv:
+        legacy_argv = [value for value in argv if value != "--legacy-engine"]
+        original_argv = sys.argv
+        try:
+            sys.argv = [sys.argv[0], *legacy_argv]
+            legacy_main()
+        finally:
+            sys.argv = original_argv
+        return 0
+    return static_mpc_main(argv)
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

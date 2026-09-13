@@ -15,6 +15,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 
 
 SLOTS_PER_DAY = 144
@@ -35,11 +37,13 @@ class PriceForecastInfo:
     fallback_days: int
     selected_alpha: float | None = None
     model_name: str = "same_week_decay"
+    ar1_phi: float = 0.0
+    latest_actual_feature_time: str | None = None
 
 
 RIDGE_START_LAG_DAYS = 14
-DEFAULT_RIDGE_ALPHA = 0.5
-_RIDGE_MODEL_CACHE: dict[tuple[int, int, float], tuple[np.ndarray, np.ndarray, float, np.ndarray]] = {}
+DEFAULT_RIDGE_ALPHA = 1.0
+_RIDGE_MODEL_CACHE: dict[tuple[int, int, float], tuple[StandardScaler, Ridge]] = {}
 
 
 def read_price_matrix(
@@ -305,8 +309,8 @@ def _fit_ridge_residual_model(
     max_train_day_index: int,
     alpha: float,
     min_train_days: int = 7,
-) -> tuple[np.ndarray, np.ndarray, float, np.ndarray] | None:
-    """用闭式解训练标准化Ridge模型，不依赖sklearn。"""
+) -> tuple[StandardScaler, Ridge] | None:
+    """仅用截止日以前样本拟合StandardScaler和固定alpha的Ridge。"""
 
     if alpha <= 0:
         raise ValueError("Ridge alpha必须为正")
@@ -327,29 +331,21 @@ def _fit_ridge_residual_model(
     if x_train.size == 0:
         return None
 
-    mean_x = x_train.mean(axis=0)
-    std_x = x_train.std(axis=0)
-    std_x[std_x < 1e-12] = 1.0
-    z_train = (x_train - mean_x) / std_x
-
-    mean_y = float(residual_train.mean())
-    centered_y = residual_train - mean_y
-    lhs = z_train.T @ z_train
-    lhs.flat[:: lhs.shape[0] + 1] += float(alpha)
-    rhs = z_train.T @ centered_y
-    beta = np.linalg.solve(lhs, rhs)
-
-    model = (mean_x, std_x, mean_y, beta)
-    _RIDGE_MODEL_CACHE[cache_key] = model
-    return model
+    scaler = StandardScaler()
+    z_train = scaler.fit_transform(x_train)
+    model = Ridge(alpha=float(alpha))
+    model.fit(z_train, residual_train)
+    fitted = (scaler, model)
+    _RIDGE_MODEL_CACHE[cache_key] = fitted
+    return fitted
 
 
 def _predict_ridge_residual(
-    model: tuple[np.ndarray, np.ndarray, float, np.ndarray],
+    model: tuple[StandardScaler, Ridge],
     x_test: np.ndarray,
 ) -> np.ndarray:
-    mean_x, std_x, mean_y, beta = model
-    return mean_y + ((x_test - mean_x) / std_x) @ beta
+    scaler, estimator = model
+    return estimator.predict(scaler.transform(x_test))
 
 
 def _fallback_decay(candidate_decays: list[float] | None, default: float = 0.90) -> float:
@@ -365,7 +361,7 @@ def _forecast_one_day_ridge_residual(
     price_history: np.ndarray,
     dates: pd.DatetimeIndex,
     day_index: int,
-    model: tuple[np.ndarray, np.ndarray, float, np.ndarray] | None,
+    model: tuple[StandardScaler, Ridge] | None,
     fallback_decay: float,
     latest_allowed_index: int,
     max_same_week_days: int,
@@ -450,7 +446,7 @@ def forecast_price_for_targets_ridge_residual(
     targets: pd.DatetimeIndex,
     ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
     candidate_decays: list[float] | None = None,
-    min_train_days: int = 7,
+    min_train_days: int = 1,
     max_same_week_days: int = 5,
     fallback_days: int = 7,
     residual_decay_slots: float = 36.0,
@@ -505,13 +501,36 @@ def forecast_price_for_targets_ridge_residual(
             working_price[day_index, :decision_slot] = price_matrix[day_index, :decision_slot]
 
     intraday_bias = 0.0
+    ar1_phi = 0.0
     if decision_slot > 0 and current_day_index in daily_forecasts:
         observed_residual = (
             price_matrix[current_day_index, :decision_slot]
             - daily_forecasts[current_day_index][:decision_slot]
         )
         if observed_residual.size:
-            intraday_bias = float(np.median(observed_residual))
+            recent = observed_residual[-6:]
+            weights = np.arange(1, len(recent) + 1, dtype=float)
+            intraday_bias = float(np.average(recent, weights=weights))
+
+        # AR(1)只由决策时刻以前的完整历史日及当天已揭示残差估计。
+        historical_residual = []
+        for past in range(1, current_day_index):
+            if past >= 7:
+                base = price_matrix[past - 7]
+            else:
+                base = price_matrix[:past].mean(axis=0)
+            historical_residual.append(price_matrix[past] - base)
+        x_parts = [row[:-1] for row in historical_residual]
+        y_parts = [row[1:] for row in historical_residual]
+        if observed_residual.size >= 2:
+            x_parts.append(observed_residual[:-1])
+            y_parts.append(observed_residual[1:])
+        if x_parts:
+            x = np.concatenate(x_parts)
+            y = np.concatenate(y_parts)
+            denominator = float(x @ x)
+            if denominator > 1.0e-12:
+                ar1_phi = float(np.clip((x @ y) / denominator, -0.98, 0.98))
 
     forecast = np.zeros(len(targets), dtype=float)
     for position, target in enumerate(targets):
@@ -522,8 +541,8 @@ def forecast_price_for_targets_ridge_residual(
             int((pd.Timestamp(target) - decision_time).total_seconds() // (SLOT_MINUTES * 60)),
             1,
         )
-        if decision_slot > 0 and residual_decay_slots > 0:
-            base_value += intraday_bias * np.exp(-lead_slots / residual_decay_slots)
+        if decision_slot > 0:
+            base_value += intraday_bias * (ar1_phi ** lead_slots)
         forecast[position] = max(float(base_value), 0.0)
 
     if model is None:
@@ -538,7 +557,25 @@ def forecast_price_for_targets_ridge_residual(
             "跨日目标用预测曲线递推构造可用历史特征"
         )
     if decision_slot > 0:
-        reason += f"；日内已发生价格残差中位数={intraday_bias:.4f}"
+        reason += (
+            f"；最近6个已发生残差加权状态={intraday_bias:.4f}，"
+            f"AR(1)系数={ar1_phi:.4f}"
+        )
+
+    latest_actual_feature_time = (
+        decision_time if decision_slot > 0
+        else decision_time - pd.Timedelta(minutes=SLOT_MINUTES)
+    )
+    if latest_actual_feature_time > decision_time:
+        raise AssertionError("真实电价特征晚于decision_time")
+    # 跨午夜所需的lag1和日统计量来自working_price中的因果混合曲线：
+    # 已观测前缀是真实值，未观测后缀仍为预测值。
+    if decision_slot > 0:
+        if not np.allclose(
+            working_price[current_day_index, decision_slot:],
+            daily_forecasts[current_day_index][decision_slot:],
+        ):
+            raise AssertionError("跨午夜特征错误使用了当天未来真实价格")
 
     info = PriceForecastInfo(
         selected_decay=float(fallback_decay),
@@ -549,6 +586,8 @@ def forecast_price_for_targets_ridge_residual(
         fallback_days=int(fallback_days),
         selected_alpha=float(ridge_alpha),
         model_name="ridge_residual",
+        ar1_phi=ar1_phi,
+        latest_actual_feature_time=str(latest_actual_feature_time),
     )
     return forecast, info
 

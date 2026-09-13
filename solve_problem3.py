@@ -109,6 +109,7 @@ class RunConfig:
     g0_scale_factor: float = 1.0
     final_soc: float = 6000.0
     solver_tolerance: float = 1.0e-7
+    forecast_source: str = "attachment3"
 
 
 @dataclass
@@ -225,13 +226,20 @@ def _numeric_matrix(frame: pd.DataFrame, name: str) -> np.ndarray:
     return values
 
 
-def read_problem_data(data_dir: Path) -> ProblemData:
-    """读取附件1、2、3并执行结构审计；原始功率统一除以6得到kWh。"""
+def read_problem_data(data_dir: Path, forecast_source: str = "attachment3") -> ProblemData:
+    """Read inputs 1/2; attachment3 is required only for published-forecast mode."""
 
     attachment1 = data_dir / "附件1.xlsx"
     attachment2 = data_dir / "附件2.xlsx"
     attachment3 = data_dir / "附件3.xlsx"
-    for path in (attachment1, attachment2, attachment3):
+    if forecast_source not in ("attachment3", "history-only"):
+        raise ValueError(f"未知预测来源：{forecast_source}")
+    required = (
+        (attachment1, attachment2, attachment3)
+        if forecast_source == "attachment3"
+        else (attachment1, attachment2)
+    )
+    for path in required:
         if not path.exists():
             raise FileNotFoundError(f"缺少必需附件：{path}")
 
@@ -270,6 +278,24 @@ def read_problem_data(data_dir: Path) -> ProblemData:
         )
     actual_load_kwh = _numeric_matrix(load_raw.iloc[:, 1:], "附件2负荷") / 6.0
     actual_pv_kwh = _numeric_matrix(pv_raw.iloc[:, 1:], "附件2光伏") / 6.0
+
+    if forecast_source == "history-only":
+        return ProblemData(
+            dates=dates,
+            input_time_labels=input_time_labels,
+            price=price,
+            reference_load_kwh=reference_load_kwh,
+            reference_pv_kwh=reference_pv_kwh,
+            actual_load_kwh=actual_load_kwh,
+            actual_pv_kwh=actual_pv_kwh,
+            forecasts=pd.DataFrame(columns=["issue_time", "hourly_kw"]),
+            data_audit={
+                "forecast_source": "history-only",
+                "attachment1_shape": list(ref.shape),
+                "attachment2_load_shape": list(load_raw.shape),
+                "attachment2_pv_shape": list(pv_raw.shape),
+            },
+        )
 
     forecast_raw = pd.read_excel(attachment3)
     if forecast_raw.shape != (1460, 26):
@@ -447,12 +473,68 @@ def forecast_load(
     return np.maximum(result, 0.0)
 
 
+def _history_profile(data: ProblemData, issue: pd.Timestamp, kind: str, history_days: int) -> np.ndarray:
+    """Only completed days strictly before issue may contribute to this profile."""
+    prior = [i for i, day in enumerate(data.dates) if day < issue.normalize()]
+    reference = data.reference_load_kwh if kind == "load" else data.reference_pv_kwh
+    if not prior:
+        return reference.copy()
+    values = data.actual_load_kwh if kind == "load" else data.actual_pv_kwh
+    recent = prior[-history_days:]
+    if kind == "load":
+        weekend = issue.dayofweek >= 5
+        similar = [i for i in recent if (data.dates[i].dayofweek >= 5) == weekend]
+        return values[similar if len(similar) >= 3 else recent].mean(axis=0)
+
+    # Separate daily energy from the normalized intraday PV shape.
+    recent_pv = values[recent[-min(7, len(recent)):]]
+    totals = recent_pv.sum(axis=1)
+    valid = totals > 1.0e-9
+    if not valid.any():
+        return np.zeros(SLOTS_PER_DAY)
+    shape = (recent_pv[valid] / totals[valid, None]).mean(axis=0)
+    return float(totals.mean()) * shape
+
+
+def _history_only_scenarios(
+    data: ProblemData, decision_time: pd.Timestamp, config: RunConfig
+) -> ScenarioBundle:
+    if decision_time.hour != 0 or decision_time.minute != 0:
+        raise ValueError("history-only仅支持0:00决策")
+    targets = make_targets(decision_time)
+    if len(targets) != SLOTS_PER_DAY:
+        raise ValueError("history-only需要完整的144个日前时段")
+    base_load = _history_profile(data, decision_time, "load", config.history_days)
+    base_pv = _history_profile(data, decision_time, "pv", config.history_days)
+    cutoff = decision_time - pd.Timedelta(days=config.history_days)
+    sources = [day for day in data.dates if cutoff <= day < decision_time]
+    if len(sources) > config.scenario_count:
+        sources = sources[-config.scenario_count:]
+    load_paths, pv_paths = [], []
+    for source in sources:
+        historical_load = _history_profile(data, source, "load", config.history_days)
+        historical_pv = _history_profile(data, source, "pv", config.history_days)
+        actual_idx = data.day_index(source.date())
+        load_paths.append(np.maximum(base_load + data.actual_load_kwh[actual_idx] - historical_load, 0.0))
+        pv_paths.append(np.maximum(base_pv + data.actual_pv_kwh[actual_idx] - historical_pv, 0.0))
+    load = np.asarray(load_paths) if load_paths else base_load[None, :]
+    pv = np.asarray(pv_paths) if pv_paths else base_pv[None, :]
+    return ScenarioBundle(
+        targets=targets, base_load=base_load, base_pv=base_pv,
+        load=load, pv=pv, probabilities=np.full(len(load), 1.0 / len(load)),
+        source_issues=[pd.Timestamp(day) for day in sources], decision_time=decision_time,
+    )
+
+
 def build_scenarios(
     data: ProblemData,
     decision_time: pd.Timestamp,
     config: RunConfig,
 ) -> ScenarioBundle:
     """Walk-forward抽取同一发布时间的成熟24小时联合残差轨迹。"""
+
+    if config.forecast_source == "history-only":
+        return _history_only_scenarios(data, decision_time, config)
 
     targets = make_targets(decision_time)
     base_load = forecast_load(
@@ -808,14 +890,15 @@ def solve_stochastic_mpc(
     final_hard_terminal = bool(bundle.targets[-1] == YEAR_END)
     if (
         final_hard_terminal
-        and not initial_decision
-        and decision_slot == UPDATE_SLOTS[18]
+        # Apply whenever this decision commits the entire remaining horizon:
+        # S0 does that at 00:00; rolling policies do it at 18:00.
+        and commit_count == len(bundle.targets)
         and commit_count >= 9
     ):
-        # The 18:00 decision must leave one causal discharge opportunity
-        # immediately before the final interval. Otherwise a positive final
-        # contract can create surplus, and w>0 => d=0 makes exact terminal SOC
-        # impossible even though the unconstrained LP trajectory is feasible.
+        # The final full-horizon commitment must leave causal discharge
+        # opportunities immediately before the last interval. Otherwise a
+        # positive contract can create surplus, and w>0 => d=0 makes exact
+        # terminal SOC impossible even though the unconstrained LP is feasible.
         # Eight intervals cover the worst possible 4,320 kWh output needed
         # to move from SOC max to the 6,000 kWh target at eta_d=0.9. Capping
         # purchases at the minimum causal scenario net load reserves a legal
@@ -829,7 +912,10 @@ def solve_stochastic_mpc(
             - reserve_output_per_slot,
             0.0,
         )
-        for index, cap in zip(commit_index[reserve_slice], robust_caps):
+        committed_purchase_index = g0_index if initial_decision else commit_index
+        for index, cap in zip(
+            committed_purchase_index[reserve_slice], robust_caps
+        ):
             bounds[int(index)] = (0.0, float(cap))
     salvage = _terminal_value(price, params)
 
@@ -1430,6 +1516,14 @@ def simulate_strategy(
         raise ValueError("initial_soc超出储能上下界")
     if progress_every_days <= 0:
         raise ValueError("progress_every_days必须为正整数")
+    if config.forecast_source == "history-only" and (
+        strategy != "S0" or control_policy not in (None, "static_plan")
+    ):
+        raise ValueError("history-only仅支持S0/static_plan，不支持日内预测更新")
+    if config.forecast_source not in ("attachment3", "history-only"):
+        raise ValueError(f"未知预测来源：{config.forecast_source}")
+    if config.forecast_source == "history-only" and config.load_forecast_mode == "net-hgb":
+        raise ValueError("history-only不支持附件3净负荷预测器")
     if config.load_forecast_mode not in LOAD_FORECAST_MODES:
         raise ValueError(f"未知负荷预测模式：{config.load_forecast_mode}")
     if config.day_ahead_mode not in DAY_AHEAD_MODES:
@@ -1577,6 +1671,7 @@ def simulate_strategy(
                     "decision_time": decision_time,
                     "forecast_issue_time": bundle.decision_time,
                     "scenario_count": int(bundle.net_load.shape[0]),
+                    "forecast_source": config.forecast_source,
                     "source_issue_times": "|".join(str(x) for x in bundle.source_issues),
                     "latest_source_target_time": latest_mature_target,
                     "mature_only": bool(
@@ -2396,6 +2491,10 @@ def _parse_date(text: str) -> date:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="问题3三时间尺度因果滚动随机MPC")
+    parser.add_argument(
+        "--forecast-source", choices=("attachment3", "history-only"),
+        default="attachment3", help="预测数据来源；history-only仅支持S0"
+    )
     parser.add_argument("--data-dir", type=Path, default=Path("附件"))
     parser.add_argument(
         "--output-dir", "--out-dir", dest="output_dir", type=Path,
@@ -2499,7 +2598,7 @@ def main(argv: list[str] | None = None) -> int:
         or args.progress_every_days <= 0
     ):
         raise ValueError("场景数、历史天数、连续运行天数和进度打印间隔必须为正数")
-    data = read_problem_data(args.data_dir)
+    data = read_problem_data(args.data_dir, forecast_source=args.forecast_source)
     params = StorageParams()
     config = RunConfig(
         scenario_count=args.scenarios,
@@ -2513,6 +2612,7 @@ def main(argv: list[str] | None = None) -> int:
         terminal_value_mode=args.terminal_value_mode,
         g0_scale_region=args.g0_scale_region,
         g0_scale_factor=args.g0_scale_factor,
+        forecast_source=args.forecast_source,
     )
     requested_end = args.date + timedelta(days=args.days - 1)
     if args.all_year:
@@ -2536,6 +2636,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if not date(2025, 1, 1) <= end_day <= date(2025, 12, 31):
         raise ValueError("日期必须位于2025年")
+    if args.forecast_source == "history-only" and (
+        args.all_subsets or args.ablation or args.control_comparison
+        or (args.control_policy is None and normalize_strategy(args.strategy) != "S0")
+        or (args.control_policy is not None and args.control_policy != "static_plan")
+    ):
+        raise ValueError("history-only仅支持S0/static_plan")
     control_requested = args.control_comparison or args.control_policy is not None
     if control_requested and (args.ablation or args.all_subsets or args.all_year):
         raise ValueError(

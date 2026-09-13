@@ -1,25 +1,22 @@
 """
-问题二：日前购电计划 + 日内因果 DP 执行
+问题二：使用问题三共享引擎运行history-only预测与static_plan策略。
 
-正式评价区间：
-2025-02-01 至 2025-12-31
+从2025-01-01连续回放SOC；正式费用只统计2025-02-01至2025-12-31。
+默认输出到新的analysis_outputs/problem2_history_only_*目录，不覆盖已有结果。
 
 运行示例：
 python solve_problem2.py
-python solve_problem2.py --max-days 7
-python solve_problem2.py --candidate-quantiles 0.6 0.75 0.9
-python solve_problem2.py --soc-step 500
-
-输出目录：
-C:/Users/LENOVO/Desktop/数模/C题/outputs/problem2/
+python solve_problem2.py --max-days 1 --scenarios 2 --soc-step 500
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from uuid import uuid4
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -830,7 +827,7 @@ def plot_results(
     plt.close(fig)
 
 
-def main():
+def legacy_main():
     parser = argparse.ArgumentParser(
         description="问题二：日前LP + 日内因果DP"
     )
@@ -1491,6 +1488,71 @@ def main():
     print(f"结果明细：{detail_path}")
     print(f"每日汇总：{daily_path}")
     print(f"Excel结果：{excel_path}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run problem 2 with the shared S0 engine and the formal February-December scope."""
+    from solve_problem3 import main as run_shared_engine
+
+    parser = argparse.ArgumentParser(description="问题2：历史预测、0点静态计划与连续SOC回放")
+    parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent / "附件")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--max-days", type=int, default=None, help="仅测试前N个正式评价日（含31天预热）")
+    parser.add_argument("--scenarios", type=int, default=12)
+    parser.add_argument("--history-days", type=int, default=30)
+    parser.add_argument("--soc-step", type=float, default=100.0)
+    parser.add_argument("--progress-every-days", type=int, default=1)
+    args = parser.parse_args(argv)
+    if args.max_days is not None and not 1 <= args.max_days <= 334:
+        parser.error("--max-days必须位于1至334之间")
+    end = date(2025, 12, 31) if args.max_days is None else date(2025, 2, 1) + timedelta(days=args.max_days - 1)
+    days = (end - date(2025, 1, 1)).days + 1
+    output_dir = args.output_dir or (
+        Path(__file__).resolve().parent / "analysis_outputs"
+        / f"problem2_history_only_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:8]}"
+    )
+    if output_dir.exists():
+        parser.error(f"输出目录已存在，拒绝覆盖：{output_dir}")
+
+    run_shared_engine([
+        "--data-dir", str(args.data_dir), "--output-dir", str(output_dir),
+        "--date", "2025-01-01", "--days", str(days),
+        "--control-policy", "static_plan", "--forecast-source", "history-only",
+        "--scenarios", str(args.scenarios), "--history-days", str(args.history_days),
+        "--soc-step", str(args.soc_step),
+        "--progress-every-days", str(args.progress_every_days),
+    ])
+    detail = pd.read_csv(output_dir / "problem3_detail.csv")
+    daily = pd.read_csv(output_dir / "daily_summary.csv")
+    audit = pd.read_csv(output_dir / "forecast_audit.csv")
+    formal = detail[(detail["date"] >= "2025-02-01") & (detail["date"] <= "2025-12-31")]
+    formal_daily = daily[(daily["date"] >= "2025-02-01") & (daily["date"] <= "2025-12-31")]
+    comparison = pd.read_csv(output_dir / "control_comparison.csv").iloc[0]
+    assert len(formal_daily) == (args.max_days or 334)
+    assert len(daily) == days and daily.iloc[0]["date"] == "2025-01-01"
+    assert (pd.to_datetime(audit["decision_time"]).dt.hour == 0).all()
+    assert (audit["forecast_source"] == "history-only").all()
+    assert (detail[["upward_adjustment_kwh", "downward_adjustment_kwh"]].abs() < 1e-7).all().all()
+    assert np.allclose(daily["soc_start_kwh"].to_numpy()[1:], daily["soc_end_kwh"].to_numpy()[:-1], atol=1e-6)
+    assert np.isclose(float(daily.iloc[31]["soc_start_kwh"]), float(daily.iloc[30]["soc_end_kwh"]), atol=1e-6)
+    total = float(formal["total_cost_yuan"].sum())
+    assert np.isclose(total, float(comparison["total_cost_yuan"]), atol=0.01)
+    if args.max_days is None:
+        assert len(formal_daily) == 334 and np.isclose(float(daily.iloc[-1]["soc_end_kwh"]), 6000, atol=1e-6)
+    report = {
+        "forecast_source": "history-only", "control_policy": "static_plan",
+        "preheat_days": 31, "formal_days": len(formal_daily),
+        "formal_start": "2025-02-01", "formal_end": str(end),
+        "formal_total_cost_yuan": total,
+        "jan31_soc_end_kwh": float(daily.iloc[30]["soc_end_kwh"]),
+        "feb1_soc_start_kwh": float(daily.iloc[31]["soc_start_kwh"]),
+        "ending_soc_kwh": float(daily.iloc[-1]["soc_end_kwh"]),
+    }
+    (output_dir / "problem2_formal_summary.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"问题2正式费用（不含1月）：{total:.2f} 元；正式天数：{len(formal_daily)}；输出：{output_dir}")
+    return 0
 
 
 if __name__ == "__main__":
